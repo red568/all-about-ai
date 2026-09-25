@@ -676,3 +676,228 @@ python3 ai_full_stack_lab.py \
 ### Level 1：常见 NVIDIA GPU 基线
 
 在隔离环境中安装与你的 Python、驱动和 CUDA 路径匹配的 PyTorch。安装命令会变化，应从 PyTorch 官方安装选择器获取，不要盲目复制某台机器的 wheel URL。安装后先做能力检测：
+
+```
+python3 -m venv .venv-stack
+source .venv-stack/bin/activate
+python -m pip install --upgrade pip
+# 按 https://pytorch.org/get-started/locally/ 选择适合本机的稳定版命令
+
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch CUDA runtime:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name())
+    print("capability:", torch.cuda.get_device_capability())
+    print("memory GiB:", round(torch.cuda.get_device_properties(0).total_memory / 2**30, 2))
+PY
+```
+
+运行 GPU 路径：
+
+```
+python ai_full_stack_lab.py \
+  --torch --device cuda --matrix-n 512 --pin-memory \
+  --items 40 --io-delay-ms 3 \
+  --json-out stack_report_cuda.json
+```
+
+脚本不会硬编码 RTX 3080/3090、4090、5090、A100 或 H100。它自动报告实际 GPU、Compute Capability、显存、PyTorch 与 CUDA Runtime 版本。 `--pin-memory` 只在 CUDA 路径使用。
+
+注意：实验为保证阶段计时可解释，在 H2D 和矩阵乘后调用了 `torch.cuda.synchronize()` 。这会阻止单个 item 内的 copy-compute 异步重叠，但仍可观察 CPU 预取与 GPU 消费的流水线。若要研究真正的 H2D/compute 双缓冲，应使用两个 host/device buffer、非默认 stream 和 CUDA Event 计时；第 11、21 课会实现。
+
+### Level 2：架构与集群专项检查
+
+拥有多 GPU 或集群时，先记录拓扑，不直接套用结论：
+
+```
+nvidia-smi topo -m
+nvidia-smi -q | sed -n '1,120p'
+
+# Kubernetes 集群（需要相应权限）
+kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.capacity.nvidia\.com/gpu
+kubectl describe node NODE_NAME
+```
+
+可选验证范围：
+
+- Ampere RTX 3080/3090、Ada RTX 4090：可以完成通用 CUDA 路径；具体型号是否有可用 NVLink 必须以硬件和 `nvidia-smi topo -m` 为准。
+- A100、H100/H200、B100/B200/GB200：可在正确的平台上进一步验证 NVLink/NVSwitch、MIG 或数据中心互联。
+- Blackwell RTX 5090：属于 Blackwell，但不应假设具备 B200/GB200 的 NVSwitch、MIG 或机架级互联。
+- Hopper/Blackwell 的 FP8/FP4 与 Transformer Engine 不是本实验的组成部分；缺少对应硬件和软件栈时只执行 FP32 回退，不能宣称完成等价验证。
+
+## 预期现象
+
+输出包含四部分：
+
+1. `inventory` ：主机、CPU、内存、容器提示与可用的 NVIDIA GPU/拓扑信息。
+2. `serial` ：串行执行总时间、吞吐、各阶段均值和 P95。
+1. `prefetch` ：生产者预取与消费者计算重叠后的结果。
+2. `speedup` 与 `correctness` ：加速比和逐 item 校验。
+
+有 3 ms 人为 I/O 等待且 CPU 计算时间与之接近时，预取版本通常快于串行版本，但具体数值由 CPU、文件系统、计时噪声和 Python 版本决定。去掉等待后，预取的线程与队列开销可能抵消收益。GPU 路径的矩阵规模太小时，CPU dispatch 与同步占比会很高；规模太大则计算成为唯一瓶颈，隐藏 I/O 的相对收益减小。
+
+不要把课程示例的 speedup 写成你的 GPU 结论。应保存本机 JSON、重复多次、报告环境与分布。
+
+## 结果分析
+
+### 用阶段模型解释，而不是只看加速比
+
+假设某次实测串行每 item 平均为：读取 3.2 ms、预处理 0.2 ms、计算 3.0 ms、后处理 0.1 ms。串行下界约为 6.5 ms/item；理想二阶段流水线间隔接近 `max(3.4, 3.1)=3.4 ms` ，但首尾气泡、线程、队列和抖动会使真实结果更慢。
+
+若计算变成 20 ms，预取最多隐藏约 3.4 ms，速度提升有限；若读取变成 30 ms，继续优化 GPU 计算也不会显著提升流水线吞吐。正确的下一步是找当前 `max(stage)` ，而不是继续优化已经较快的阶段。
+
+### 为什么 P95 仍然重要
+
+流水线吞吐受最慢阶段的长期服务率约束，尾延迟则会让队列突然积压。若读取均值 3 ms、偶尔 100 ms，即使均值看起来能供满 GPU，有限预取队列仍会耗尽。生产系统应联合观察阶段分布、队列深度和 GPU 空洞，而不是只记录平均值。
+
+### 正确性为何属于性能实验
+
+预取改变了并发与缓冲生命周期。常见错误包括覆盖仍在使用的 buffer、输出乱序、异步任务尚未完成就读取结果。本实验逐 item 对比 checksum；真实训练还需检查 loss 曲线、梯度与最终质量，推理还需检查输出和容许的数值误差。一个更快但结果错误的系统，Goodput 为零。
+
+## 优化前后对照
+
+| 维度 | 串行基线 | 预取流水线 | 需要守住的边界 |
+| --- | --- | --- | --- |
+| 执行关系 | read → preprocess → compute | producer 与 consumer 并行 | 数据依赖和顺序正确 |
+| steady-state | 各阶段时间相加 | 接近最慢阶段 | 有资源并行且无严重争用 |
+| 首项延迟 | 一次完整路径 | 通常没有同比改善 | 不把吞吐收益冒充 TTFT 收益 |
+| 内存 | 单个缓冲 | 最多 `prefetch` 个缓冲 | 防止队列过深与 OOM |
+| 故障行为 | 直接暴露 | 线程错误可能导致等待 | 生产代码要传播异常与超时 |
+| 可观测性 | 总时间 | 分阶段、吞吐、P95、校验 | 统一请求/item 标识 |
+
+全栈优化不是永远增加并发。若存储和计算争用同一内存带宽，或 GPU 已饱和，预取可能恶化 P99。以证据决定是否保留优化。
+
+## 常见错误与排查
+
+### 1\. nvidia-smi 可用，但 PyTorch 报 CUDA 不可用
+
+检查：
+
+```
+nvidia-smi
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+这通常是 PyTorch wheel、驱动兼容范围、设备暴露或容器 runtime 问题。 `nvcc --version` 代表本地 toolkit，不等同于 PyTorch 实际使用的 runtime。
+
+### 2\. pin\_memory 没有加速
+
+Pinned memory 只是异步 H2D 的必要条件之一，不保证端到端收益。小张量固定开销、同步计时、CPU 内存压力或计算已经是瓶颈时，收益可能为零。用 CUDA Event 和时间线确认复制是否真正重叠。
+
+### 3\. GPU 利用率低，就立即增加 batch
+
+先找空洞原因。增加 batch 可能掩盖 CPU launch 问题，也可能引发 OOM、增大 TTFT，或改变请求公平性。训练看 step 分解；推理同时看 TTFT、TPOT、Tokens/s 和 Goodput。
+
+### 4\. 容器内性能比宿主机差
+
+检查 CPU quota/cpuset、NUMA 放置、 `/dev/shm` 、挂载存储、设备节点、驱动库路径和安全策略。先用相同镜像、相同输入与相同资源边界做 A/B。
+
+### 5\. Kubernetes 申请了多 GPU，但通信慢
+
+`nvidia.com/gpu: 4` 只表达数量，不表达 4 张卡之间的链路。检查 Pod 实际可见设备、 `nvidia-smi topo -m` 、NUMA/NIC 亲和和 NCCL 选择的路径。必要时通过节点标签和调度策略约束放置。
+
+### 6\. 预取版本卡住
+
+教学脚本的 producer 若异常退出，consumer 可能等待 sentinel；生产实现必须把异常放入队列、设置超时并在取消时释放资源。本实验生成的临时文件很小且路径可控，正常情况下不会触发该分支。
+
+### 7\. 结果波动很大
+
+增加 items 和重复次数；区分冷启动与稳态；记录 CPU 频率、后台负载、GPU 功耗/温度、编译和缓存状态。不要只挑最快的一次。
+
+## 架构设计原则
+
+1. \*\*最小化数据移动\*\*：先问能否不移动，再问怎样移动更快。
+2. \*\*把拓扑变成显式约束\*\*：GPU、CPU、NIC 和存储路径进入调度与实验元数据。
+1. \*\*在边界处提供回压\*\*：使用有界队列、准入控制和超时，避免过载扩散。
+2. \*\*控制平面与数据平面解耦\*\*：策略可以集中，token/张量热路径尽量本地快速执行。
+1. \*\*能力检测优于型号硬编码\*\*：检测 Compute Capability、dtype、内存与通信能力，并提供安全回退。
+2. \*\*端到端 profile 后再下钻\*\*：先找关键路径，再用 Kernel 或通信工具解释局部。
+1. \*\*正确性、稳定性与成本共同定义 Goodput\*\*：吞吐不是唯一目标。
+2. \*\*优化应可撤销、可复现\*\*：保存环境、命令、输入、版本、报告和校验结果。
+
+## 面试题与答案
+
+### 1\. 为什么 GPU 利用率低不能直接说明 GPU 算力不足？
+
+因为利用率是采样现象，不是瓶颈归因。DataLoader、CPU launch、同步、H2D、collective、队列和小 Kernel 都可能造成 GPU 空洞。应先用端到端时间线把空洞与上下游事件对齐。
+
+### 2\. 框架、CUDA Runtime 和驱动分别做什么？
+
+框架提供张量、自动微分和分布式语义；编译器/算子库生成或选择具体实现；CUDA Runtime 提供 stream、event、内存和 launch 等接口；驱动负责上下文、模块和硬件任务提交。边界会因路径不同而变化，但驱动最终连接用户态软件与 GPU。
+
+### 3\. 为什么流水线提高吞吐却不一定降低首请求延迟？
+
+首请求仍要穿过全部阶段；流水线的收益来自后续请求的不同阶段重叠，steady-state 间隔接近最慢阶段而非阶段之和。
+
+### 4\. 数据平面和控制平面如何区分？
+
+数据平面执行请求、张量、token、梯度和通信；控制平面负责放置、配置、版本、健康、扩缩容和恢复。控制决策会影响数据路径，但不应让高延迟控制操作进入每个细粒度热路径。
+
+### 5\. Kubernetes 为什么不能只靠 nvidia.com/gpu: N 保证多卡性能？
+
+该资源通常表达数量，不表达型号、显存、NVLink/NVSwitch、NUMA 或 NIC 亲和。需要设备发现、标签、亲和/队列/拓扑策略，并在 Pod 内实测通信路径。
+
+### 6\. Pinned memory 为什么有助于 H2D？
+
+可分页内存可能需要先复制到固定页缓冲区。Pinned host memory 可以用于真正的异步传输，但要与 non-blocking copy、独立 stream、正确依赖和可用复制引擎配合；它也消耗不可分页系统内存，不能无限使用。
+
+### 7\. 如何解释“Kernel 加速 2 倍，端到端只快 5%”？
+
+用 Amdahl 定律检查该 Kernel 在端到端的占比；也检查优化后瓶颈是否转移到数据、调度、通信或其他 Kernel。局部微基准与系统 workload 的调用形状、频率也可能不同。
+
+### 8\. 如何判断通信是否能与反向计算重叠？
+
+检查梯度 bucket 何时 ready、collective 所在 stream、依赖 event、计算和通信资源竞争，以及时间线上的真实并发。仅看到 `async_op=True` 不足以证明硬件重叠。
+
+### 9\. RTX 4090 属于 Blackwell 吗？
+
+不属于。RTX 4090 是 Ada Lovelace；RTX 5090 是 Blackwell。架构名称仍不能替代具体产品能力检测。
+
+### 10\. 为什么可观测性必须在架构阶段设计？
+
+因为请求 ID、step/rank、CPU range、CUDA event 和调度状态若没有共同关联，事后很难重建跨层关键路径。低开销采样、trace 上下文和实验元数据需要预先定义。
+
+## 课后练习
+
+1. \*\*阶段敏感性分析\*\*：分别设置 `--io-delay-ms` 为 0、1、3、10，设置 `--compute-rounds` 为 1000、8000、30000，画出串行/预取吞吐和 speedup。解释每个区域的瓶颈。
+2. \*\*队列深度实验\*\*：比较 `--prefetch 1/2/8/32` 的吞吐和进程内存。说明为什么更深不必然更快。
+1. \*\*冷/热分离\*\*：修改脚本，分别报告首个 item 和后续 items 的延迟，讨论其与推理 TTFT 的相似和不同。
+2. \*\*GPU 实验\*\*：在可用 GPU 上比较 `--matrix-n 128/512/2048` ，保存 GPU 型号、Compute Capability、显存、PyTorch/CUDA 版本和 JSON；不得跨机器只比较绝对时间而忽略环境。
+1. \*\*架构图\*\*：为你熟悉的训练或推理服务画出数据平面、控制平面、可观测平面，并标注队列、同步点、容量上限和故障边界。
+2. \*\*Kubernetes 设计题\*\*：写一个节点能力标签方案，使 A100 任务、RTX 4090 任务和 H100 FP8 任务不会被错误混调；说明哪些能力必须运行时再次验证。
+1. \*\*进阶\*\*：给 producer 增加异常传播和超时取消；用单元测试证明 consumer 不会永久阻塞。
+
+## Checklist
+
+### 架构
+
+- 已画出训练 step 或推理请求的端到端关键路径。
+- 已区分数据平面、控制平面和可观测平面。
+- 已标注队列、同步点、缓存、状态与故障边界。
+- 已明确吞吐目标、尾延迟目标和正确性约束。
+
+### 环境与能力
+
+- 已记录 OS、Python、框架、CUDA Runtime 和驱动版本。
+- 已检测 GPU 名称、Compute Capability、显存和实际可用设备。
+- 多卡时已记录 PCIe/NVLink/NVSwitch/NUMA/NIC 拓扑。
+- 没有把 RTX 4090 误写为 Blackwell。
+- 没有用模拟结果冒充 NVLink、RDMA、FP8/FP4 或 Transformer Engine 实测。
+
+### 性能诊断
+
+- 已区分冷启动、warmup 和 steady state。
+- 已同时记录端到端与阶段耗时，而非只看 GPU 利用率。
+- 已检查 P50/P95/P99、队列深度和资源利用。
+- 每项优化都有因果假设、对照、正确性检查和回滚方式。
+- 优化后已检查瓶颈是否转移到上下游。
+
+### 实验交付
+
+- Level 0 可在无 NVIDIA GPU 环境运行。
+- Level 1 通过能力检测适配常见 NVIDIA GPU，而非硬编码型号。
+- Level 2 写清支持矩阵、专属能力与不可等价模拟边界。
+- 已保存命令、配置、JSON 报告和异常结果。
