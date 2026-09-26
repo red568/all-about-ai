@@ -21,6 +21,51 @@
 ![image\.png](图片和附件/image.png)
 
 
+```mermaid
+
+sequenceDiagram
+
+    participant C as 客户端
+
+    participant A as API Server (HTTP)
+
+    participant T as TokenizerManager
+
+    participant S as Scheduler
+
+    participant R as DetokenizerManager
+
+    participant G as GPU / ModelRunner
+
+  
+
+    C->>A: 发送 prompt "写一首诗"
+
+    A->>T: 转发请求
+
+    Note over T: 把文字切成 token ids<br/>(分词 tokenize)
+
+    T->>S: 发送 tokenized 请求
+
+    Note over S: 放入等待队列 waiting_queue<br/>等待调度
+
+    S->>G: run_batch：执行 forward
+
+    G-->>S: 返回 logits
+
+    Note over S: 采样下一个 token<br/>更新请求状态
+
+    S->>R: 发送新生成的 token
+
+    R-->>A: 拼回文字 (detokenize)
+
+    A-->>C: 流式返回给用户
+
+```
+
+
+
+
 
 # 四、perfill
 
@@ -144,6 +189,18 @@ https://www.usenix.org/conference/osdi22/presentation/yu
 2. 后加入的request怎么处理
 
 3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+
+### Iteration-Level Scheduling
+
+![[Pasted image 20260927010539.png]]
+
+
+
+
+
+### Selective Batching
+
+
 
 
 
