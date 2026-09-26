@@ -2,6 +2,7 @@
 # 一、推理核心问题
 
 
+
 ![0fdca02b2fdbabb776e534268b2bb70f\.png](图片和附件/0fdca02b2fdbabb776e534268b2bb70f.png)
 
 # 二、sglang的整体架构
@@ -22,6 +23,12 @@
 
 
 # 四、perfill
+
+## perfill究竟在干什么
+
+
+
+
 
 ## 为什么perfill和decode要分离
 
@@ -48,14 +55,62 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 
 ## Chunked perfill
-如果prompt太长，会让perfill的时间太长，阻塞短的请求，且使得整体perfill的结果不够丝滑，甚至会由于占据过大显存引发oom问题。因此使用chunked perfill将长的prompt划分开一段一段的
-对应的调整参数：**`--chunked-prefill-size`**
-
-
-
+### 为什么要chunked perfill
+1. prompt输入过长，perfill阶段需要为这些大量token提前分配好大量显存，造成显存峰值，可能引发oom，
+2. 排队中短prompt的perfill请求被阻塞
+3. 长时间perfill阻塞其他请求decoder过程，导致token生成速度卡顿 ，饿死其他请求
+	1. 传统调度中，长 Prompt 的 Prefill 是一个不可中断的“大块”计算。在其执行期间，已经处于 Decode 阶段的请求必须等待，导致生成停顿（Generation Stalls），表现为极高的 TBT（Time-Between-Tokens）和 P99 延迟尖峰
+	2. Chunked Prefill 的做法是将这个“大块”拆解成多个按顺序处理的“小块”（Chunk）。调度器在每个推理步骤（Iteration）中，不再一次性处理整个 Prefill，而是只处理其中一个 Chunk。处理完一个 Chunk 后，调度器就有机会将其他请求的 Decode 步骤插入进来，实现 Prefill 与 Decode 在**同一批次内的交替执行**
+	3. 其核心优势在于利用了 Decode 阶段**计算资源未被充分利用**的特性。Decode 是内存带宽瓶颈型操作，GPU 的 Tensor Core 计算单元相对空闲。将计算密集型的 Prefill Chunk 与 Decode 混合在一个批次中，可以“填补”这些空闲的计算资源，从而在不显著增加单步耗时的前提下，推进 Prefill 的进度
  
+### 实现机制
+1. 将长的请求按照设定好的chunked-prefill-size进行划分，划分成不同的chunk，每执行完一个chunk，就把控制权交还给scheduler
+2. scheduler可以决定：继续 prefill 当前 chunk 的下一块、prefill 等待队列里的新请求、跑 decode、prefill + decode 混跑（mixed chunk）
+
+### 注意点
+
+1. ==中间chunk不吐字==
+	1. 一个请求只有**最后一个 chunk 完成后**才采样（sample）第一个输出 token，并进入 decode。中间那些 chunk 只是"读题"，不产生任何输出。
+	2. 该请求的ttft不会降低
+2. 中间chunk的产生token是会缓存的，再生成下一个chunk的token时，可以从缓存中读取出来用于perfill
+3. chunk 切得越小，decode 越流畅，但 prefill 的总开销越大（因为切块本身有调度成本）。所以 chunk 大小（`chunked_prefill_size`）是一个需要权衡的旋钮
+
+### 参数调优
+#### 相关参数：
+
+| **参数**                      | **默认**                | **含义**                                              |
+| --------------------------- | --------------------- | --------------------------------------------------- |
+| `--chunked-prefill-size`    | `None` 启动过程中会被覆写，默认开启 | 每个 chunk 的最大 token 数。`-1` 也等于禁用                     |
+| `--max-prefill-tokens`      | `16384`               | 一个 prefill batch 的总 token 预算，一个遗留参数，和模型支持的上下文窗口取max |
+| `--enable-dynamic-chunking` | `False`               | 流水线并行（PP）下动态调整 chunk 大小                             |
+| `--schedule-policy`         | `fcfs`                | 调度策略，`shortest-prefill-first` 与 chunked 配合很好        |
+
+**chunk 大小怎么选？** 这是一个权衡：
+
+- **偏大**（如 8192）：切块次数少、调度开销小，但每次 prefill 更"重"，decode 会被饿得更久。
+- **偏小**（如 256）：decode 更流畅、显存峰值更低，但切块频繁、总开销上升。
+
+经验上，常见的起点是 `512` 或 `1024`，再根据实际负载的 TTFT / 吞吐曲线去调。**没有万能值**，要对着你自己的场景量。
+
+**默认的`--chunked-prefill-size`，是sglang通过显存大小默认设置的：**
+
+| GPU 显存      | 典型显卡           | 默认 chunked_prefill_size |
+| ----------- | -------------- | ----------------------- |
+| `< 20 GB`   | T4、4080        | 2048                    |
+| `20~35 GB`  | A10、4090、5090  | 4096                    |
+| `35~60 GB`  | A100 40GB、L40  | 4096                    |
+| `60~90 GB`  | H100、A100 80GB | 8192                    |
+| `90~160 GB` | H20、H200       | 8192                    |
+| `>= 160 GB` | B200、MI300     | 16384                   |
+| 拿不到显存信息     | 回退             | 4096                    |
 
 
+#### 和其他特性参数的关系
+
+- **Mixed Chunk（`--enable-mixed-chunk`）**：默认情况下，一个 batch 要么全是 prefill、要么全是 decode。Mixed chunk 允许**在同一个 batch 里既放 prefill 又放 decode**，进一步减少 GPU 空闲，这个开关是默认关闭的。
+- **Prefill / Decode Disaggregation（PD 分离）**：一般来说，chunked perfill更使用于pd不分离的场景，用于做调度调节；但是也可以使用于pd分离场景。此时把 prefill 和 decode 放到不同的机器/GPU 上。chunked prefill仅对perfill的过程起效， 是它内部"怎么把 prefill 切成可控小块"的基础手段之一。
+- **Dynamic Chunking**：针对流水线并行（PP），让每个 chunk 的计算时长尽量一致，避免流水线气泡。
+- **Split Prefill**：`schedule_batch.py:3135` 的 `prepare_for_split_prefill` 说明存在另一种"拆分 prefill"的路径，它和 chunked 在 `extend_range` 的机制上共享同一套基础设施。
 
 
 ## Prefix cache--》radix cache
@@ -66,17 +121,30 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 
 
-## 如何保证不oom
-
-
-
-
-
-
-
 # 五、Decode
 
 ## 性能卡点
+自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
+==解决方式：==
+1. 批处理
+2. 投机解码
+3. 更高效/准确的解码策略
+## 批处理-Continuous batch
+https://www.usenix.org/conference/osdi22/presentation/yu
+
+### 为什么批处理
+1. 每次取出一次kv cache中的kv，但是只计算一个token很亏，算力有冗余，可以算一批
+2. 
+
+
+### 批处理面临三个问题：
+
+1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
+
+2. 后加入的request怎么处理
+
+3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+
 
 
 ## 解码策略
@@ -85,6 +153,14 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 
 ## 投机解码
+
+
+
+
+
+
+
+## 如何保证不oom
 
 
 
@@ -247,35 +323,55 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
     L1 GPU 显存，L2 本机 CPU 内存，L3 分布式共享存储；统一管理本地 + 分布式 KV 缓存，兼顾访问延迟与总容量。
 
 
-## 生产应用之radis cache 
+## sglang应用-radis cache原理 
 
 
-## 生产应用之hicache
-
+## sglang生产应用之hicache
+https://docs.sglang.io/docs/advanced_features/hicache
 
 
 ## 生产应用之mooncake
 
+https://github.com/kvcache-ai/Mooncake
+
+https://kvcache-ai.github.io/Mooncake/
 
 
-# 七、serving调度和服务视角
-## Continuous batch
-
-主要面临三个问题：
-
-1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
-
-2. 后加入的request怎么处理
-
-3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+# pd分离和pd不分离
 
 
 
 
+# 七、serving：scheduler调度
+
+
+## 调度策略
 
 
 
 
+
+## 相关参数
+
+
+### --enable-mixed-chunk
+**允许在一个batch内，既可以perfill既可以decode**
+
+**推荐启用的场景**
+
+- **长文本处理**：当处理超过 **4k tokens** 的长文本时，启用此参数可实现预填充与解码的混合优化。
+    
+- **高并发、长输入**：在并发数 ≥ 200 且输入长度 ≥ 4096 的场景下，混合批次的收益更为明显。若结合 `--enable-flashinfer-pod-attention`（需同时指定 `--attention-backend flashinfer`），吞吐可提升 **4%–48%**，TTFT 和 TPOT 改善 **5%–30%**。在极端配置下（输入 16384、并发 1024），吞吐提升可达 **47.7%**。
+
+**不建议或需谨慎使用的场景**
+
+- **MLA（Multi-head Latent Attention）模型**：对于使用 MLA 的模型（如 DeepSeek 系列），Prefill 和 Decode 的**计算/内存访问特性差异较大**，官方讨论中建议**分开批次处理**，混合可能无法带来收益甚至适得其反。
+    
+- **特定硬件后端**：在 **Ascend NPU** 上，该功能在某些场景下（如 DeepSeek-V3.2 模型）**不受支持**。
+    
+- **正则表达式约束请求**：曾有 Bug 报告，启用 `--enable-mixed-chunk` 后，使用 JSON 正则的请求可能**返回错误结果**。虽然该 Issue 时间较早（2024 年），但在生产环境用于此类请求时仍需谨慎验证。
+    
+- **已知的稳定性问题**：社区中曾报告过启用后导致**崩溃**的 Bug（Issue #6921），以及与 CUDA Graph、词表张量掩码的兼容性问题。建议在升级到包含相关修复的版本后再启用。
 
 
 
