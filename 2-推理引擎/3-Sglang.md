@@ -99,7 +99,71 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 
 
+
+
+## Prefix cache--》radix cache
+
+将多轮对话的公共前缀部分的kv cache利用起来，减少perfill过程
+
+
+
+# 五、Decode
+
+## 性能卡点
+自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
+==解决方式：==
+1. 批处理/chunked perfill
+2. 投机解码
+3. 更高效/准确的解码策略
+## 批处理-Continuous batch
+https://www.usenix.org/conference/osdi22/presentation/yu
+
+### 为什么批处理
+1. 每次取出一次kv cache中的kv，但是只计算一个token很亏，算力有冗余，可以算一批
+2. 
+
+
+### 批处理面临三个问题：
+
+1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
+
+2. 后加入的request怎么处理
+
+3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+
+### Iteration-Level Scheduling
+
+![[Pasted image 20260927010539.png]]
+
+iteration-level scheduling，不再等待 batch 中所有序列生成完成，而是每轮迭代动态决定 batch 大小。这样一来，batch 中的某个序列一旦完成生成，就可以立即被替换为新的请求，从而相比 Static Batching 显著提升了 GPU 的利用率。
+
+在实践中应用 iteration-level scheduling 时，我们面临的一个主要挑战就是如何实现批处理。为了达到高效执行的目的，执行引擎应当能够对任意被选中的一组请求进行批处理执行。否则，就只能一个一个地处理请求，无法发挥 GPU 的大规模并行计算能力。然而，即使只是两条请求，也无法保证它们在下一轮迭代中能够合并执行。**这是因为要实现批处理，不仅需要多个请求处于相同的阶段，还必须具有形状完全一致的输入张量。**一对请求在以下 3 种情况下，下一次迭代不能一起批处理：
+![[Pasted image 20260927230509.png]]
+
+- **两个请求都处于 prefill 阶段，但输入 token 数量不同（例如 x₃ 和 x₄）**。prefill 阶段的 Attention 是一次性并行处理整个 prompt 序列。如果两个请求的输入 token 长度不同，它们的输入张量在长度维度（L）上不一致，无法拼接成统一形状的 batch 张量 `[B, L, H]`，导致无法合批执行。请求 x₃ 的 prompt 长度是 2，输入张量形状为 `[1, 2, H]`；请求 x₄ 的 prompt 长度是 3，输入张量形状为 `[1, 3, H]`，无法拼接成一个 `[2, L, H]` 的张量，因此不能合批执行。
+- **两个请求都处于 decode 阶段，但正在生成不同位置的 token（例如 x₁ 和 x₂）。** 虽然 decode 阶段每次只处理一个 token，输入张量形状都是 `[1, H]`，但此阶段的 Attention 会依赖之前生成的所有 token（即使用 KV cache）。如果请求的生成位置不同，其 KV cache 长度也不同，导致 Attention 的 Key/Value 张量形状不同。
+- **两个请求处于不同阶段：一个在 prefill，另一个在 decode（例如 x₁ 和 x₃）。** prefill 的一次迭代会并行处理所有输入 token，以提高效率，而 decode 阶段的一次迭代则只处理一个 token。
+
+**为了解决上述挑战，一个可行的思路是：尽可能寻找这些请求在计算过程中的共性，以便将相同的部分合并执行，从而最大化批处理效率；对于差异部分，则单独处理。**
+
+### Selective Batching
+**elective Batching 的核心原理在于：仅对适合批处理的操作执行批处理，不适合批处理的操作则单独处理。**
+
+具体来说：
+
+- 对于 `preproj`、`postproj`、`FFN1` 和 `FFN2` 这类线性变换或归一化操作，它们的计算与序列长度无关，只是在 hidden_size 维度上做线性转换，并且都需要从显存读取权重。**因此，可以将 batch 内所有 token 拉平成一个二维张量**，例如 x₃ 和 x₄ 的输入张量可以合并为一个形状为 [∑L,H]=[5,H][∑L,H]=[5,H] 的二维张量，一次性完成所有相关计算。这样不仅简化了操作，还能显著提升权重加载的利用率，降低 IO 次数，提高整体执行效率。
+- 对于 Attention 操作，由于每个请求的 mask、KV cache 和 token 位置可能不同，导致其张量形状不一致，无法直接合并处理。Selective Batching 会在进入 Attention 之前将 batch 拆分，逐个请求单独计算 Attention 分数，完成后再将结果合并回统一的张量，以便继续执行后续操作。**Attention 分数的计算并不依赖显存中的模型权重，只需使用之前生成的 Q、K、V 向量即可，因此拆分处理不会带来额外的 IO 开销。**
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202507060933382.png)
+
+
+
 ## Chunked perfill
+
+SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked-Prefills： [https://arxiv.org/abs/2308.16369](https://arxiv.org/abs/2308.16369)
+Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve：[https://arxiv.org/abs/2403.02310](https://arxiv.org/abs/2403.02310)
+Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microsoft/sarathi-serve)
+
 ### 为什么要chunked perfill
 1. prompt输入过长，perfill阶段需要为这些大量token提前分配好大量显存，造成显存峰值，可能引发oom，
 2. 排队中短prompt的perfill请求被阻塞
@@ -158,53 +222,11 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 - **Split Prefill**：`schedule_batch.py:3135` 的 `prepare_for_split_prefill` 说明存在另一种"拆分 prefill"的路径，它和 chunked 在 `extend_range` 的机制上共享同一套基础设施。
 
 
-## Prefix cache--》radix cache
-
-
-
-
-
-
-
-# 五、Decode
-
-## 性能卡点
-自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
-==解决方式：==
-1. 批处理
-2. 投机解码
-3. 更高效/准确的解码策略
-## 批处理-Continuous batch
-https://www.usenix.org/conference/osdi22/presentation/yu
-
-### 为什么批处理
-1. 每次取出一次kv cache中的kv，但是只计算一个token很亏，算力有冗余，可以算一批
-2. 
-
-
-### 批处理面临三个问题：
-
-1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
-
-2. 后加入的request怎么处理
-
-3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
-
-### Iteration-Level Scheduling
-
-![[Pasted image 20260927010539.png]]
-
-
-
-
-
-### Selective Batching
-
-
-
 
 
 ## 解码策略
+
+
 
 
 
