@@ -71,6 +71,7 @@ sequenceDiagram
 
 ## perfill究竟在干什么
 
+tokenize之后进行perfill，首先进行embedding，映射为向量，然后经过模型的层层计算，
 
 
 
@@ -93,9 +94,11 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 ## flashAttention
 
+### 原理
 
 
 
+### sglang参数
 
 
 
