@@ -792,6 +792,29 @@ https://kvcache-ai.github.io/Mooncake/
 ## pd分离
 
 
+## 并行策略
+
+### 张量并行（tensor parallel， TP）
+把**同一层内部的权重张量**切到多张 GPU。所有 rank 同时计算这一层的不同分片，再通过 AllReduce、AllGather 等集合通信恢复完整结果。
+TP 同时减少单卡权重与部分 activation/KV cache，并能并行执行大矩阵乘法；代价是层内通信频繁，因此通常放在 NVLink/NVSwitch 等高速互联的单机内。
+
+### 数据并行dp（data parallel, DP）
+每张 GPU 保存一份**完整模型**，但处理不同的数据或请求。训练时，各副本通过 AllReduce 同步梯度；推理时通常让不同副本独立服务不同请求。
+优点是吞吐扩展简单；缺点是每张卡仍需放下完整模型，因此不能解决“单个模型放不下”的问题。
+
+![[Pasted image 20261006011322.png]]
+
+
+### 流水线并行（Pipeline Parallelism，PP）
+
+把连续的网络层分成多个 stage，每张 GPU 负责一段层，activation 按顺序从前一 stage 传到后一 stage。多个 micro-batch 可以像流水线一样交错执行。
+![[Pasted image 20261006011704.png]]
+
+PP 能降低每卡权重占用，而且 stage 间只传 activation；但单个请求仍要依次经过所有 stage，micro-batch 不足时会出现 pipeline bubble。LLM decode 每步只有少量 token，bubble 尤其明显。
+### ep
+
+
+
 
 ## 通信协议
 
@@ -817,6 +840,11 @@ https://kvcache-ai.github.io/Mooncake/
 
 3. 核心区别：集合通信是N个gpu一起抢带宽，而点对点通信仅有2个
 
+| **操作**               | **每张卡的输入**       | **所有 rank 完成后的结果** | **AIOS 用途**                |
+| ---------------- | ------------ | -------------- | ---------------------- |
+| `AllReduce(SUM)` | 同一坐标的局部贡献    | 每卡得到逐元素总和      | Row Parallel、Embedding |
+| `AllGather`      | 不同坐标的分片      | 每卡得到所有 shard   | LM head logits         |
+| `Broadcast`      | 仅源 rank 有权威值 | 每卡得到源 rank 的值  | 采样 token               |
 
 
 ⚠️ 注意：通信发生在不同层级的硬件上，带宽差一个数量级——机内 NVLink 可达数百 GB/s，机间 InfiniBand 约 50 GB/s 量级，PCIe 更低。同样一个 AllReduce，放机内还是跨机，耗时可能差十倍。这是后续所有”哪个策略放哪里”决策的物理根源。
@@ -829,25 +857,11 @@ https://kvcache-ai.github.io/Mooncake/
 
 
 
-## 并行策略
-
-### tp
-
-
-
-### dp
 
 
 
 
-### ep
-
-
-
-
-
-
-# attention backend
+# Attention Backend
 https://docs.sglang.io/docs/advanced_features/attention_backend
 
 **Attention Backend 是底层的“计算内核”**：它是真正在 GPU 上执行注意力计算的**算子实现**（如 FlashAttention、FlashInfer、Triton 等）。它负责“如何高效计算一次注意力”，解决的是 **“计算性能”** 问题
@@ -858,9 +872,24 @@ https://docs.sglang.io/docs/advanced_features/attention_backend
 SGLang 官方文档对 FlashInfer 后端的定位是：**在非 Hopper 架构的 GPU（如 A100、A40）上，用于通用 MHA 模型的高性能注意力实现**，具有广泛的功能支持（包括 FP8 KV Cache）。
 
 因此，如果你使用的是 **A100 等非 Hopper GPU**，并希望获得对 FP8 KV Cache、滑动窗口等特性的良好支持，FlashInfer 通常是 SGLang 下的一个优选后端。如果你在 **Hopper（H100/H800）** 上，SGLang 的自动选择机制可能会倾向于使用 **FA3（FlashAttention 3）** 后端，因为它在 Hopper 上可能有更优的表现。
-## FA3
 
 
+## FlashAttention
+### 原理
+1. attention计算可以视为分块矩阵的计算
+2. softmax可以通过在线softmax通过局部最大值迭代出整体最大值，从而计算softmax
+![[Pasted image 20261005235704.png]]
+![[Pasted image 20261005235932.png]]
+
+![[Pasted image 20261005235847.png]]
+![[Pasted image 20261006000052.png]]
+
+### FA3
+
+
+
+
+### FA4
 
 
 ## sglang参数
@@ -890,6 +919,7 @@ SGLang 官方文档对 FlashInfer 后端的定位是：**在非 Hopper 架构的
 这就是算子融合的核心：**把多个相邻算子的 tile loop 合并成一个 loop，让中间 tile 尽量留在片上存储中**。它不改变数学结果，也不一定减少主计算量；它减少的是 GPU 调度次数和 HBM 读写次数。
 
  decode 阶段每步 token 很少，小 kernel 和中间张量读写会被反复放大。融合后，模型层内部的局部数据流更像右图：一次读取、片上连续计算、一次写回。这个变化会在每一层、每一个 decode step 重复累积，所以即使单个算子很小，总体收益仍然明显。
+ ==不同模型具体如何进行算子融合是case by case的==
 ### Merged Linear 原理
 
 Merged Linear 的核心是一个简单的线性代数等价关系：如果多个线性层共享同一个输入 `x`，就不必分别执行多次 GEMM，而是把它们的权重沿**输出维**拼在一起，执行一次更宽的 GEMM(General Matrix Multiply，通用矩阵乘法)
@@ -947,9 +977,5 @@ KV 写入保持在 `MHAKVCache.store_kv()`，但其实现委托给 `kernel.sto
 
 ## cuda graph
 
-
-
-
-
-
-## tensor并行
+CUDA Graphs 解决的不是数学计算量，而是**重复执行同一形状 decode step 时的 CPU 调度成本**
+CUDA Graph 把 kernel、memcpy、memset 等 GPU 操作表示为节点，把 stream 顺序或 event 表达为依赖边。它**不会融合 kernel，也不会减少模型 FLOPs**；它优化的是整组操作的 提交方式：先记录完整工作流，后续通过一次 `cudaGraphLaunch` 提交可执行图。 [NVIDIA 的入门示例](https://developer.nvidia.com/blog/cuda-graphs/)中，一个 2.9 μs 的短 kernel 在普通异步 launch 模式下平均耗时为 3.8 μs；使用 graph 后降为 3.4 μs。具体数值与硬件和 CUDA 版本有关，但它说明了为什么“kernel 很快”时 launch 开销反而更显眼。
