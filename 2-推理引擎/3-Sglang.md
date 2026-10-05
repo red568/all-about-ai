@@ -1,4 +1,6 @@
 
+http://theneuralbase.com/sglang/learn/advanced
+https://sglang.org/zh/advanced_features
 # 一、推理核心问题
 
 
@@ -188,7 +190,143 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 ![image\.png](图片和附件/image%201.png)
 
-## Chunked perfill
+
+# 五、Decode
+
+## Decode在做什么
+自回归过程，将之前缓存的k,v读出来，和当前新的kv cat在一起，计算logic，每次只输出一个token
+
+![[Pasted image 20261005154057.png]]
+
+## 性能卡点
+自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
+==解决方式：==
+1. 批处理/chunked perfill
+2. 投机解码
+3. 更高效/准确的解码策略
+
+## 解码策略
+
+### temperature
+主要作用：调节概率分布的“尖锐/平坦”程度
+模型原始 logits 记为z_i。softmax 得到概率：
+$$p_i = \frac{\exp(z_i)}{\sum_j \exp(z_j)}$$
+
+加入温度 T后：
+$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
+
+- **T < 1**：logits 差距被放大，softmax 后分布更尖锐，高概率 token 更容易被选中，生成更确定、保守。
+    
+- **T = 1**：使用模型原始分布。
+    
+- **T > 1**：logits 差距被缩小，分布更平坦，低概率 token 也有更多机会，生成更随机、多样。
+    
+- **T → 0**：极限上接近 greedy，总是选概率最高的 token。实际实现里通常直接把 T=0 当作贪心解码
+
+影响：
+- 低温度：适合事实问答、代码、数学、结构化输出，但容易重复、死板。
+- 高温度：适合创意写作、头脑风暴，但更容易跑偏、幻觉、语法错误。
+### top k（只保留概率最高的k个候选）
+
+1. 对所有 token 的 logits 排序；
+    
+2. 只保留分数最高的 kk 个 token；
+    
+3. 其余 token 概率置 0；
+    
+4. 在剩下的 k 个 token 中重新归一化并采样。
+
+大模型词表通常有几万到几十万 token。很多低概率 token 虽然单个概率很低，但数量巨大，合起来可能被采样到，导致输出莫名其妙。Top-k 直接砍掉长尾，只从最可能的 k 个里选，降低“胡言乱语”的概率。
+
+### top p
+
+模型先输出每个 token 的 logits，经过温度缩放和 softmax 后得到概率分布 pipi​。
+
+Top-p 的步骤：
+
+1. 把所有 token 按概率从高到低排序。
+    
+2. 从最高概率开始累加，直到累积概率达到或超过阈值 p。
+    
+3. 保留这个最小集合，其余 token 概率置 0。
+    
+4. 在保留的 token 中重新归一化，然后按新概率采样。
+    
+
+数学上，设排序后概率为 p(1)≥p(2)≥…，找到最小的 k 使得：
+
+$$\sum_{i=1}^{k} p_{(i)} \ge p$$
+然后只保留前 kk个 token，重新归一化：
+$$p'_i =
+\begin{cases}
+\frac{p_i}{\sum_{j \le k} p_j}, & i \le k \\
+0, & i > k
+\end{cases}$$
+
+最后从 p′中采样下一个 token。
+
+ **Top-p 的作用**
+
+==① 动态控制候选集大小==
+
+Top-p 不固定保留多少个 token，而是根据当前概率分布动态决定。
+
+- 如果模型很确定，最高概率 token 占主导，Top-p 可能只保留 1~2 个 token。
+    
+- 如果模型不确定，概率分布平坦，Top-p 会保留更多 token。
+
+这比 Top-k 更自适应。Top-k 固定保留 k 个，在分布尖锐时可能保留了太多没必要的低概率 token，在分布平坦时又可能截得太狠。
+
+==② 砍掉长尾，降低胡言乱语==
+
+大模型词表有几万到几十万 token。很多低概率 token 单个概率极低，但数量巨大，合起来仍可能被采样到，导致输出跑偏、幻觉或语法错误。Top-p 只保留累积概率达到 p 的核心 token，把长尾直接排除。
+
+==③ 在质量和多样性之间平衡==
+
+- **p 小**，比如 0.5~0.7：候选集小，生成更确定、保守，但多样性差，容易重复。
+    
+- **p 大**，比如 0.9~0.95：候选集大，生成更多样，但可能引入低质量 token。
+    
+- **p = 1**：不截断，保留全部 token，等于不启用 Top-p。
+    
+- **p 非常小**：可能只剩最高概率 token，近似 greedy 解码。
+    
+
+实践中常用 **p = 0.9 或 0.95**，在稳定性和多样性之间取得平衡
+
+
+
+
+### 一般用法：
+> logits → 除以温度 T → 选 top-k → 对 top-k 重新 softmax → 采样
+
+- 稳定任务：T=0~0.3，top-k=1~20，top-p=0.1~0.5；
+    
+- 平衡任务：T=0.7~1.0，top-k=40~100，top-p=0.9~0.95；
+    
+- 创意任务：T=1.0~1.5，top-k 更大或 top-p=0.95~1.0。
+
+
+
+## 投机解码
+
+### MTP
+
+
+### DSpark
+
+
+
+
+
+## 如何保证不oom
+
+
+
+
+
+
+# 六、Chunked perfill
 
 SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked-Prefills： [https://arxiv.org/abs/2308.16369](https://arxiv.org/abs/2308.16369)
 Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve：[https://arxiv.org/abs/2403.02310](https://arxiv.org/abs/2403.02310)
@@ -253,22 +391,7 @@ Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microso
 
 
 
-
-
-# 五、Decode
-
-## Decode在做什么
-自回归过程，将之前缓存的k,v读出来，和当前新的kv cat在一起，计算logic，每次只输出一个token
-
-![[Pasted image 20261005154057.png]]
-
-## 性能卡点
-自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
-==解决方式：==
-1. 批处理/chunked perfill
-2. 投机解码
-3. 更高效/准确的解码策略
-## 批处理-Continuous batch
+# 七、批处理-Continuous batch
 https://www.usenix.org/conference/osdi22/presentation/yu
 
 ### 为什么批处理
@@ -276,13 +399,18 @@ https://www.usenix.org/conference/osdi22/presentation/yu
 2. 
 
 
-### 批处理面临三个问题：
+### 批处理面临三个问题--核心是schduler调度
 
 1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
 
 2. 后加入的request怎么处理
 
 3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+
+### static batching
+将一批请求封装处理，提高gpu核心利用率
+
+
 
 ### Iteration-Level Scheduling
 
@@ -299,6 +427,7 @@ iteration-level scheduling，不再等待 batch 中所有序列生成完成，�
 
 **为了解决上述挑战，一个可行的思路是：尽可能寻找这些请求在计算过程中的共性，以便将相同的部分合并执行，从而最大化批处理效率；对于差异部分，则单独处理。**
 
+
 ### Selective Batching
 **elective Batching 的核心原理在于：仅对适合批处理的操作执行批处理，不适合批处理的操作则单独处理。**
 
@@ -311,70 +440,63 @@ iteration-level scheduling，不再等待 batch 中所有序列生成完成，�
 
 
 ### 参数调优
+| 参数                            | 默认值    | 说明                                                                                                                                                                                                                                                                                                       | 建议取值与调整时机                                                                                                                                                                                                                              |
+| ----------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--max-batch-size`            | 64     | 单次前向传播（forward pass）中可处理的最大请求数[](http://theneuralbase.com/sglang/learn/advanced/cost-efficiency/)。                                                                                                                                                                                                       | **生产环境常用 64**。追求高吞吐可增至 **128**，但需监控显存。低延迟场景可降至 **32** 或更低。                                                                                                                                                                             |
+| `--batch-wait-timeout-s`      | 0.1    | 调度器等待收集请求以组成一个批次的最长时间（秒）。                                                                                                                                                                                                                                                                                | **对延迟敏感**（如 p99 < 100ms）：设 **0.05**。**追求最大吞吐**：可设 **0.5**[](http://theneuralbase.com/sglang/learn/advanced/cost-efficiency/)。                                                                                                          |
+| `--schedule-conservativeness` | 1.0    | 调度“保守度”。值**越小越激进**，会接纳更多请求；值**越大越保守**，避免 OOM[](https://gitee.com/jkmopl/vllm-read/raw/87c1248db1e8b538717170dac7b102d14606f018/books/SGLang%E6%8E%A8%E7%90%86%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%AE%9E%E6%88%98%E6%95%99%E7%A8%8B.pdf#20#6)[](https://sglang.org/zh/advanced_features/hyperparameter_tuning)。 | 若看到 `token usage < 0.9` 且 `#queue-req > 0`，可降至 **0.3**。若频繁出现 KV cache 满的警告，可增至 **1.3**[](https://sglang.org/zh/advanced_features/hyperparameter_tuning)。                                                                               |
+| `--mem-fraction-static`       | 0.9    | 分配给**模型权重 + KV 缓存池**的 GPU 显存比例[](https://sglang.org/zh/advanced_features/hyperparameter_tuning)。                                                                                                                                                                                                         | 默认值较高。若遇到 OOM，可降至 **0.8** 或 **0.7**。若显存充裕，可增至 **0.95** 以扩大 KV 缓存。                                                                                                                                                                      |
+| `--max-running-requests`      | 自动     | 允许同时运行的最大请求数。默认通常为 64。                                                                                                                                                                                                                                                                                   | **OOM 时降低**此值；**GPU 利用率低时增大**此值。增加前务必确认显存充足[](https://gitee.com/jkmopl/vllm-read/raw/87c1248db1e8b538717170dac7b102d14606f018/books/SGLang%E6%8E%A8%E7%90%86%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%AE%9E%E6%88%98%E6%95%99%E7%A8%8B.pdf#20#6)。 |
+| `--chunked-prefill-size`      | 16384  | 分块预填充（Chunked Prefill）的块大小。影响长提示词的处理[](https://gitee.com/jkmopl/vllm-read/raw/87c1248db1e8b538717170dac7b102d14606f018/books/SGLang%E6%8E%A8%E7%90%86%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%AE%9E%E6%88%98%E6%95%99%E7%A8%8B.pdf#20#6)。                                                                          | 长上下文场景，减小到 **4096** 可降低首 Token 延迟（TTFT）。若预填充阶段 OOM，可降至 **2048**[](https://docs.sglang.com.cn/backend/hyperparameter_tuning.html#enabling-cache-for-torch-compile)。                                                                     |
+| `--schedule-policy`           | `fcfs` | 调度策略，可选 `fcfs`（先到先服务）、`lpm`（最长前缀匹配）等[](https://gitee.com/jkmopl/vllm-read/raw/87c1248db1e8b538717170dac7b102d14606f018/books/SGLang%E6%8E%A8%E7%90%86%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%AE%9E%E6%88%98%E6%95%99%E7%A8%8B.pdf#20#6)。                                                                          | 高并发且请求有共享前缀（如相同 System Prompt）时，尝试 **`lpm`** 可提升缓存命中率。                                                                                                                                                                                 |
+| `--cuda-graph-max-bs`         | 160    | CUDA Graph 捕获的最大批大小，可减少内核启动开销。                                                                                                                                                                                                                                                                           | 通常设置为与 `--max-running-requests` 相等。若显存紧张，可降低（如设为 80）以减少图内存开销。                                                                                                                                                                          |
 
+### Attention backend对于批处理的影响（主要是perfill的处理）
+不同 Attention Backend 对批处理的影响，核心差异在于**如何处理“变长序列”和“混合批处理（prefill + decode）”**。这决定了 GPU 利用率、显存效率和最终吞吐量的高低。
 
+==Prefill 阶段的批处理，本质是处理一批长度不一的用户输入（Prompt）。==
 
-
-
-## 解码策略
-
-### temperature
-主要作用：调节概率分布的“尖锐/平坦”程度
-模型原始 logits 记为z_i。softmax 得到概率：
-$$p_i = \frac{\exp(z_i)}{\sum_j \exp(z_j)}$$
-
-加入温度 T后：
-$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
-
-- **T < 1**：logits 差距被放大，softmax 后分布更尖锐，高概率 token 更容易被选中，生成更确定、保守。
+- **FlashInfer（Flat Varlen）**：将批次中所有请求的 token **拼接成一个连续的一维长张量**，用 `indptr` 数组标记每个请求的起止位置。这种“拍平”方式让内核无需为每个请求单独启动，一次处理所有 token，并通过其独特的 `plan/run` 解耦机制，在 `plan` 阶段动态调度计算任务，以缓解长短序列带来的负载不均衡。
     
-- **T = 1**：使用模型原始分布。
+- **FlashAttention 3/4（`cu_seqlens` 寻址）**：同样支持变长序列，通过显式传入 `cu_seqlens_q` 和 `cu_seqlens_k` 来标记边界，内核直接基于偏移量寻址。它不进行物理拼接，而是依赖硬件特性（如 TMA）和 **Split-K** 并行化来提升效率。
     
-- **T > 1**：logits 差距被缩小，分布更平坦，低概率 token 也有更多机会，生成更随机、多样。
+- **Triton（程序ID + 块掩码）**：不要求输入是拼接的张量。内核通过**程序ID**索引批次，在内部动态计算每个请求的数据位置，并通过**块掩码**在计算时跳过被遮蔽的部分。这种方式灵活性高，但在极端不规则的工作负载下，效率可能低于前两者。
+
+# 八、serving：scheduler调度
+
+
+## 调度策略
+
+
+
+
+
+## 相关参数
+
+
+### --enable-mixed-chunk
+**允许在一个batch内，既可以perfill既可以decode**
+
+**推荐启用的场景**
+
+- **长文本处理**：当处理超过 **4k tokens** 的长文本时，启用此参数可实现预填充与解码的混合优化。
     
-- **T → 0**：极限上接近 greedy，总是选概率最高的 token。实际实现里通常直接把 T=0 当作贪心解码
+- **高并发、长输入**：在并发数 ≥ 200 且输入长度 ≥ 4096 的场景下，混合批次的收益更为明显。若结合 `--enable-flashinfer-pod-attention`（需同时指定 `--attention-backend flashinfer`），吞吐可提升 **4%–48%**，TTFT 和 TPOT 改善 **5%–30%**。在极端配置下（输入 16384、并发 1024），吞吐提升可达 **47.7%**。
 
-影响：
-- 低温度：适合事实问答、代码、数学、结构化输出，但容易重复、死板。
-- 高温度：适合创意写作、头脑风暴，但更容易跑偏、幻觉、语法错误。
-### top k（只保留概率最高的k个候选）
+**不建议或需谨慎使用的场景**
 
-1. 对所有 token 的 logits 排序；
+- **MLA（Multi-head Latent Attention）模型**：对于使用 MLA 的模型（如 DeepSeek 系列），Prefill 和 Decode 的**计算/内存访问特性差异较大**，官方讨论中建议**分开批次处理**，混合可能无法带来收益甚至适得其反。
     
-2. 只保留分数最高的 kk 个 token；
+- **特定硬件后端**：在 **Ascend NPU** 上，该功能在某些场景下（如 DeepSeek-V3.2 模型）**不受支持**。
     
-3. 其余 token 概率置 0；
+- **正则表达式约束请求**：曾有 Bug 报告，启用 `--enable-mixed-chunk` 后，使用 JSON 正则的请求可能**返回错误结果**。虽然该 Issue 时间较早（2024 年），但在生产环境用于此类请求时仍需谨慎验证。
     
-4. 在剩下的 k 个 token 中重新归一化并采样。
-
-大模型词表通常有几万到几十万 token。很多低概率 token 虽然单个概率很低，但数量巨大，合起来可能被采样到，导致输出莫名其妙。Top-k 直接砍掉长尾，只从最可能的 k 个里选，降低“胡言乱语”的概率。
-
-==一般用法：==
-> logits → 除以温度 T → 选 top-k → 对 top-k 重新 softmax → 采样
-
-- 稳定任务：T=0~0.3，top-k=1~20，top-p=0.1~0.5；
-    
-- 平衡任务：T=0.7~1.0，top-k=40~100，top-p=0.9~0.95；
-    
-- 创意任务：T=1.0~1.5，top-k 更大或 top-p=0.95~1.0。
-
-## 投机解码
+- **已知的稳定性问题**：社区中曾报告过启用后导致**崩溃**的 Bug（Issue #6921），以及与 CUDA Graph、词表张量掩码的兼容性问题。建议在升级到包含相关修复的版本后再启用。
 
 
 
 
-
-
-
-## 如何保证不oom
-
-
-
-
-
-
-
-# 六、Kv cache的实现和优化手段
+# 九、Kv cache的实现和优化手段
 
 ![[Pasted image 20260926160258.png]]
 
@@ -415,9 +537,107 @@ $$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
 不改变 KV 本身大小，优化显存分配、生命周期、共享复用，解决碎片、重复计算浪费，是现代推理引擎的基础底座。
 
 ### 朴素 Dynamic kv cahche
+最简单的 KV cache 形式，就是一个 Python 列表，里面每层存一个 `(K, V)` 元组：
+
+```python
+
+# KV cache: 每层保存一个 (key_cache, value_cache) 元组
+
+# key_cache shape:   (batch, num_kv_heads, seq_len_so_far, head_dim)
+
+# value_cache shape: (batch, num_kv_heads, seq_len_so_far, head_dim)
+
+  
+
+past_key_values: list[tuple[Tensor, Tensor]] = []
+
+```
+
+在 attention 中，使用 `torch.cat` 更新 cache：
+
+```python
+
+# In the attention forward:
+
+if past_key_value is not None:
+
+    # 把新 K,V 沿着 sequence 维度拼接到历史缓存后面
+
+    k = torch.cat([past_key_value[0], k], dim=2)  # dim=2 是 seq_len
+
+    v = torch.cat([past_key_value[1], v], dim=2)
+
+  
+
+# 新的 (k, v) 就包含了从位置 0 到当前位置的全部 key/value
+
+present_key_value = (k, v)
+
+```
+
+这和 HuggingFace 内部 `DynamicCache` 的工作方式本质上是一样的。
+
+==`torch.cat` 的问题==
+
+虽然 `torch.cat` 能保证结果正确，但它有一个明显的性能问题：
+
+```
+
+Step 1: cache = [K0, V0]                    → cat 拷贝 1 份
+
+Step 2: cache = [K0, K1, V0, V1]            → cat 拷贝 2 份
+
+Step 3: cache = [K0, K1, K2, V0, V1, V2]    → cat 拷贝 3 份
+
+...
+
+Step n: cache = [K0..Kn, V0..Vn]            → cat 拷贝 n 份
+
+  
+
+总拷贝量 = 1 + 2 + 3 + ... + n = n(n+1)/2 = O(n^2)
+
+```
+
+每次 `torch.cat` 都会分配一个**新的 tensor**，把整个旧 cache 连同新的条目一起重新复制一遍。对于一个 36 层模型，生成 1000 个 token：
+
+```
+
+分配次数：36 层 × 2（K,V）× 1000 步 = 72,000 次分配
+
+拷贝体量：36 × 2 × (1 + 2 + ... + 1000) ≈ 3600 万份 tensor 拷贝
+
+```
+
+![[Pasted image 20261005165110.png]]
+图里每个小方块代表一个 token 的 KV 占用。Dynamic 的增长路径是：每步生成新 token 时，用 `torch.cat` 拼接历史与新 token。
+
+当前实现位置：
+- `python/aios/kvcache/dynamic.py`
+- 类：`DynamicKVCache`
+
+优点：
+- 实现最简单，代码短，便于教学和调试。
+- 和“连续内存 + 直接 attention”思路一致，容易验证 correctness。
+
+缺点：
+- 每次增长都要分配更大张量并复制旧内容，增长成本高。
+- 序列越长，累计复制越重（典型 `1 + 2 + ... + n` 模式）。
+- 并发请求多时，容易引入额外内存抖动。
 
 
+### Preallocated Cache
+![[Pasted image 20261005165544.png]]
 
+图里每个小方块也是一个 token 槽位。Preallocated 是“先按 `max_seq_len` 整块预留，再按位置写入”。
+
+优点：
+- 生成过程无需反复扩容，单请求写入路径直。
+- 对固定长度任务，延迟稳定。
+
+缺点：
+- 预留但未使用的槽位会长期占用显存。
+- 多短请求并发时，显存利用率差（空洞占用明显）。
 
 ### PagedAttention 分页注意力（vLLM， sglang内存管理 核心）   
 
@@ -563,46 +783,15 @@ https://github.com/kvcache-ai/Mooncake
 https://kvcache-ai.github.io/Mooncake/
 
 
-# 七、pd分离和pd不分离
 
 
 
 
-# 八、serving：scheduler调度
+# 十、分布式通信和并行策略
+
+## pd分离
 
 
-## 调度策略
-
-
-
-
-
-## 相关参数
-
-
-### --enable-mixed-chunk
-**允许在一个batch内，既可以perfill既可以decode**
-
-**推荐启用的场景**
-
-- **长文本处理**：当处理超过 **4k tokens** 的长文本时，启用此参数可实现预填充与解码的混合优化。
-    
-- **高并发、长输入**：在并发数 ≥ 200 且输入长度 ≥ 4096 的场景下，混合批次的收益更为明显。若结合 `--enable-flashinfer-pod-attention`（需同时指定 `--attention-backend flashinfer`），吞吐可提升 **4%–48%**，TTFT 和 TPOT 改善 **5%–30%**。在极端配置下（输入 16384、并发 1024），吞吐提升可达 **47.7%**。
-
-**不建议或需谨慎使用的场景**
-
-- **MLA（Multi-head Latent Attention）模型**：对于使用 MLA 的模型（如 DeepSeek 系列），Prefill 和 Decode 的**计算/内存访问特性差异较大**，官方讨论中建议**分开批次处理**，混合可能无法带来收益甚至适得其反。
-    
-- **特定硬件后端**：在 **Ascend NPU** 上，该功能在某些场景下（如 DeepSeek-V3.2 模型）**不受支持**。
-    
-- **正则表达式约束请求**：曾有 Bug 报告，启用 `--enable-mixed-chunk` 后，使用 JSON 正则的请求可能**返回错误结果**。虽然该 Issue 时间较早（2024 年），但在生产环境用于此类请求时仍需谨慎验证。
-    
-- **已知的稳定性问题**：社区中曾报告过启用后导致**崩溃**的 Bug（Issue #6921），以及与 CUDA Graph、词表张量掩码的兼容性问题。建议在升级到包含相关修复的版本后再启用。
-
-
-
-
-# 九、分布式通信和并行策略
 
 ## 通信协议
 
@@ -642,34 +831,125 @@ https://kvcache-ai.github.io/Mooncake/
 
 ## 并行策略
 
-tp
-dp
-ep
+### tp
+
+
+
+### dp
+
+
+
+
+### ep
 
 
 
 
 
 
-# 十、attention backend
+# attention backend
+https://docs.sglang.io/docs/advanced_features/attention_backend
 
 **Attention Backend 是底层的“计算内核”**：它是真正在 GPU 上执行注意力计算的**算子实现**（如 FlashAttention、FlashInfer、Triton 等）。它负责“如何高效计算一次注意力”，解决的是 **“计算性能”** 问题
 
-## flashAttention
-
-### 原理
+## FlashInfer
 
 
+SGLang 官方文档对 FlashInfer 后端的定位是：**在非 Hopper 架构的 GPU（如 A100、A40）上，用于通用 MHA 模型的高性能注意力实现**，具有广泛的功能支持（包括 FP8 KV Cache）。
 
-### sglang参数
-
-
+因此，如果你使用的是 **A100 等非 Hopper GPU**，并希望获得对 FP8 KV Cache、滑动窗口等特性的良好支持，FlashInfer 通常是 SGLang 下的一个优选后端。如果你在 **Hopper（H100/H800）** 上，SGLang 的自动选择机制可能会倾向于使用 **FA3（FlashAttention 3）** 后端，因为它在 Hopper 上可能有更优的表现。
+## FA3
 
 
 
 
-# 十一、算子优化
+## sglang参数
 
 
 
 
+
+
+# 算子优化
+
+## 算子融合
+### 算子融合是什么
+
+![[Pasted image 20261005191458.png]]
+
+先看这张图。左边的未融合版本把一段连续计算拆成 `kernel A -> kernel B -> kernel C` 三个独立 GPU kernel。每个 kernel 都有自己的 tile 循环：先把输入 tile 从 DDR/HBM 读到 SRAM，计算完以后把结果写回 DDR/HBM。下一个 kernel 不能直接使用上一阶段留在片上的数据，只能再从 DDR/HBM 把中间结果读回来。
+
+所以未融合的真正代价不只是“多了几个函数调用”，而是：
+
+1. **3 次 kernel launch**：A、B、C 分别调度，decode 小 batch 下 launch 开销会变得明显。
+2. **3 个独立 for-loop**：每个 kernel 都重新遍历 tile，无法把局部数据流连续接起来。
+3. **中间张量反复落盘**：`intermediate_1`、`intermediate_2` 会经历 `SRAM -> DDR/HBM -> SRAM` 的往返，浪费 HBM 带宽。
+
+右边的融合版本把 A、B、C 放进同一个 fused kernel。对于同一块 tile，数据只从 DDR/HBM 读入一次，然后在 SRAM / registers 里连续完成 `A -> B -> C`，中间结果不写回全局显存，直到最终输出才 store 回 DDR/HBM。
+
+这就是算子融合的核心：**把多个相邻算子的 tile loop 合并成一个 loop，让中间 tile 尽量留在片上存储中**。它不改变数学结果，也不一定减少主计算量；它减少的是 GPU 调度次数和 HBM 读写次数。
+
+ decode 阶段每步 token 很少，小 kernel 和中间张量读写会被反复放大。融合后，模型层内部的局部数据流更像右图：一次读取、片上连续计算、一次写回。这个变化会在每一层、每一个 decode step 重复累积，所以即使单个算子很小，总体收益仍然明显。
+### Merged Linear 原理
+
+Merged Linear 的核心是一个简单的线性代数等价关系：如果多个线性层共享同一个输入 `x`，就不必分别执行多次 GEMM，而是把它们的权重沿**输出维**拼在一起，执行一次更宽的 GEMM(General Matrix Multiply，通用矩阵乘法)
+
+```text
+y1 = x @ W1.T
+y2 = x @ W2.T
+y3 = x @ W3.T
+
+# 等价于：
+y_merged = x @ concat(W1, W2, W3).T
+y1, y2, y3 = split(y_merged)
+```
+
+PyTorch 的 `F.linear(x, weight)` 计算 `x @ weight.T`，权重布局是 `(output_size, input_size)`。因此 merged linear 只需要把权重沿 `dim=0` 拼接；GEMM 的输出是一段连续内存，再按原始输出大小切成多个 view。这里的 `split()` 不复制数据，只是在同一块输出 buffer 上建立逻辑切片。
+
+![[Pasted image 20261005192655.png]]
+
+例如上图的两个 merged linear：
+
+- `LinearQKVMerged`：把 attention 中共享输入的 `q_proj/k_proj/v_proj` 合成一次投影，输出布局为 `[Q | K | V]`。
+- `LinearColParallelMerged`：把 MLP 中共享输入的 `gate_proj/up_proj` 合成一次投影，输出布局为 `[gate | up]`。
+
+它们对应的输出切片如下：
+
+```text
+qkv = qkv_proj(x)
+q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+gate_up = gate_up_proj(x)
+hidden = silu_and_mul(gate_up)
+```
+
+对 Qwen3-0.6B 来说：
+
+- `q_size = 16 × 128 = 2048`，`kv_size = 8 × 128 = 1024`，故 `Wqkv` 的形状为 `(4096, 1024)`，输出为 `(T, 4096)`。
+- `Wgate_up` 的形状为 `(2 × 3072, 1024) = (6144, 1024)`；`silu_and_mul` 读取其前半部分作为 gate、后半部分作为 up，输出恢复到 `(T, 3072)`。
+
+残差路径也可以合并。`fused_add_rmsnorm(x, residual)` 的语义是：
+
+```text
+residual = residual + x
+x = RMSNorm(residual)
+```
+
+因此 decoder 不再每层构造 `residual + hidden_states` 临时张量，而是持续传递 `(x, residual)`：
+![[Pasted image 20261005193013.png]]
+
+融合前，`Add` 的输出 `sum = residual + x` 同时有两条依赖边：一条把 `sum` 保存为下一子层的 `residual`，另一条把它作为 `RMSNorm` 的输入。两条算子节点之间需要将 `sum` 写回 HBM，再由下一次 kernel 读入。
+
+融合后，`fused_add_rmsnorm(x, residual)` 保留完全相同的两条输出边：`residual` 在原缓冲区原地更新，归一化结果写入 `x` 并送给 attention / MLP。拓扑从两个 GPU 节点收敛为一个节点，`sum` 仅在 SRAM / 寄存器中短暂存在。
+
+KV 写入保持在 `MHAKVCache.store_kv()`，但其实现委托给 `kernel.store_cache()`。输入是新 token 的 `(k, v, out_loc)`，内核按 `out_loc` 将整行 head vector 写入连续 cache。模型层不知道 page table 或物理 slot。
+
+
+## cuda graph
+
+
+
+
+
+
+## tensor并行
