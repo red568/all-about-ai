@@ -13,9 +13,6 @@
 
 
 
-
-
-
 # 三、一次请求的路径
 
 ![image\.png](图片和附件/image.png)
@@ -67,13 +64,114 @@ sequenceDiagram
 
 
 
-# 四、perfill
+# 四、prefill
 
-## perfill究竟在干什么
+## prefill究竟在干什么
 
-tokenize之后进行perfill，首先进行embedding，映射为向量，然后经过模型的层层计算，
+prompt被tokenize之后进行perfill，首先进行RoPE和embedding，映射为向量，经过模型的层层计算==(同样为因果注意力机制==)，将每层的k,v缓存下来，并生成第一个token
 
+==并行计算：==
 
+**prefill 在 token/序列维度上是并行计算的**，但不是“整个网络所有计算都并行”。
+
+更准确地说：
+
+- **Prompt 里的所有 token 一次性送入模型**，而不是像 decode 那样一个一个来。
+    
+- 每一层里，所有 token 的 Q/K/V 可以通过大矩阵乘法同时算出来：
+    
+    - 输入 X∈Rn×dX∈Rn×d
+        
+    - 一次矩阵乘得到所有位置的 Q、K、V
+        
+    - 注意力分数矩阵一次算完，再加 **causal mask**
+        
+- 所以虽然每个 token 只能看自己和左边的 token，但**计算过程是并行的**，mask 只是把未来位置的注意力权重屏蔽掉。
+    
+- prefill 结束后，每一层 prompt token 的 K/V 都写进 **KV Cache**。
+    
+- 然后取最后一个位置的输出，采样得到第一个生成 token。
+
+==计算过程：==
+```
+
+┌─────────────────────────────────────────────────────────────────────┐
+
+│                        LLM 推理流程                                 │
+
+├─────────────────────────────────────────────────────────────────────┤
+
+│                                                                     │
+
+│  阶段 1：PREFILL（处理 prompt）                                     │
+
+│  ┌────────────────────────────────────────────────────────────┐    │
+
+│  │  输入："What is the capital of France?"                    │    │
+
+│  │       [tok0, tok1, tok2, tok3, tok4, tok5, tok6]          │    │
+
+│  │                                                            │    │
+
+│  │  并行处理所有 prompt token                                 │    │
+
+│  │  → 为每个位置计算 Q、K、V                                  │    │
+
+│  │  → 将 K、V 写入 cache（按层保存）                          │    │
+
+│  │  → 返回最后一个位置的 logits → 生成第一个输出 token        │    │
+
+│  │                                                            │    │
+
+│  │  计算量：对 T 个 prompt token 是 O(T^2)（一次性成本）      │    │
+
+│  │  这一阶段是计算瓶颈型（大矩阵乘法）                        │    │
+
+│  └────────────────────────────────────────────────────────────┘    │
+
+│                           │                                         │
+
+│                           ▼                                         │
+
+│  阶段 2：DECODE（逐 token 生成）                                   │
+
+│  ┌────────────────────────────────────────────────────────────┐    │
+
+│  │  Step 1: 输入 = [new_tok_7]                                │    │
+
+│  │          只为这 1 个 token 计算 Q7、K7、V7                 │    │
+
+│  │          将 K7,V7 追加到 cache → cache 变为 [K0..K7,V0..V7]│    │
+
+│  │          用 Q7 对 cache 中全部 K,V 做注意力                │    │
+
+│  │          → 得到下一个 token                                │    │
+
+│  │                                                            │    │
+
+│  │  Step 2: 输入 = [new_tok_8]                                │    │
+
+│  │          只为这 1 个 token 计算 Q8、K8、V8                 │    │
+
+│  │          将 K8,V8 追加到 cache → cache 变为 [K0..K8,V0..V8]│    │
+
+│  │          用 Q8 对 cache 中全部 K,V 做注意力                │    │
+
+│  │          → 得到下一个 token                                │    │
+
+│  │                                                            │    │
+
+│  │  每一步计算量：O(n)，其中 n 是当前总序列长度               │    │
+
+│  │  这一阶段是内存带宽瓶颈型（从 HBM 中读取缓存的 K,V）       │    │
+
+│  └────────────────────────────────────────────────────────────┘    │
+
+│                                                                     │
+
+└─────────────────────────────────────────────────────────────────────┘
+
+```
 
 
 ## 为什么perfill和decode要分离
@@ -86,80 +184,9 @@ decode是自回归的过程，根据前面k v值，来计算下一个token，需
 
 两者是矛盾的
 
-## perfill面临三类压力
+## prefill面临三类压力
 
 ![image\.png](图片和附件/image%201.png)
-
-
-
-## flashAttention
-
-### 原理
-
-
-
-### sglang参数
-
-
-
-
-
-## Prefix cache--》radix cache
-
-将多轮对话的公共前缀部分的kv cache利用起来，减少perfill过程
-
-
-
-# 五、Decode
-
-## 性能卡点
-自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
-==解决方式：==
-1. 批处理/chunked perfill
-2. 投机解码
-3. 更高效/准确的解码策略
-## 批处理-Continuous batch
-https://www.usenix.org/conference/osdi22/presentation/yu
-
-### 为什么批处理
-1. 每次取出一次kv cache中的kv，但是只计算一个token很亏，算力有冗余，可以算一批
-2. 
-
-
-### 批处理面临三个问题：
-
-1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
-
-2. 后加入的request怎么处理
-
-3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
-
-### Iteration-Level Scheduling
-
-![[Pasted image 20260927010539.png]]
-
-iteration-level scheduling，不再等待 batch 中所有序列生成完成，而是每轮迭代动态决定 batch 大小。这样一来，batch 中的某个序列一旦完成生成，就可以立即被替换为新的请求，从而相比 Static Batching 显著提升了 GPU 的利用率。
-
-在实践中应用 iteration-level scheduling 时，我们面临的一个主要挑战就是如何实现批处理。为了达到高效执行的目的，执行引擎应当能够对任意被选中的一组请求进行批处理执行。否则，就只能一个一个地处理请求，无法发挥 GPU 的大规模并行计算能力。然而，即使只是两条请求，也无法保证它们在下一轮迭代中能够合并执行。**这是因为要实现批处理，不仅需要多个请求处于相同的阶段，还必须具有形状完全一致的输入张量。**一对请求在以下 3 种情况下，下一次迭代不能一起批处理：
-![[Pasted image 20260927230509.png]]
-
-- **两个请求都处于 prefill 阶段，但输入 token 数量不同（例如 x₃ 和 x₄）**。prefill 阶段的 Attention 是一次性并行处理整个 prompt 序列。如果两个请求的输入 token 长度不同，它们的输入张量在长度维度（L）上不一致，无法拼接成统一形状的 batch 张量 `[B, L, H]`，导致无法合批执行。请求 x₃ 的 prompt 长度是 2，输入张量形状为 `[1, 2, H]`；请求 x₄ 的 prompt 长度是 3，输入张量形状为 `[1, 3, H]`，无法拼接成一个 `[2, L, H]` 的张量，因此不能合批执行。
-- **两个请求都处于 decode 阶段，但正在生成不同位置的 token（例如 x₁ 和 x₂）。** 虽然 decode 阶段每次只处理一个 token，输入张量形状都是 `[1, H]`，但此阶段的 Attention 会依赖之前生成的所有 token（即使用 KV cache）。如果请求的生成位置不同，其 KV cache 长度也不同，导致 Attention 的 Key/Value 张量形状不同。
-- **两个请求处于不同阶段：一个在 prefill，另一个在 decode（例如 x₁ 和 x₃）。** prefill 的一次迭代会并行处理所有输入 token，以提高效率，而 decode 阶段的一次迭代则只处理一个 token。
-
-**为了解决上述挑战，一个可行的思路是：尽可能寻找这些请求在计算过程中的共性，以便将相同的部分合并执行，从而最大化批处理效率；对于差异部分，则单独处理。**
-
-### Selective Batching
-**elective Batching 的核心原理在于：仅对适合批处理的操作执行批处理，不适合批处理的操作则单独处理。**
-
-具体来说：
-
-- 对于 `preproj`、`postproj`、`FFN1` 和 `FFN2` 这类线性变换或归一化操作，它们的计算与序列长度无关，只是在 hidden_size 维度上做线性转换，并且都需要从显存读取权重。**因此，可以将 batch 内所有 token 拉平成一个二维张量**，例如 x₃ 和 x₄ 的输入张量可以合并为一个形状为 [∑L,H]=[5,H][∑L,H]=[5,H] 的二维张量，一次性完成所有相关计算。这样不仅简化了操作，还能显著提升权重加载的利用率，降低 IO 次数，提高整体执行效率。
-- 对于 Attention 操作，由于每个请求的 mask、KV cache 和 token 位置可能不同，导致其张量形状不一致，无法直接合并处理。Selective Batching 会在进入 Attention 之前将 batch 拆分，逐个请求单独计算 Attention 分数，完成后再将结果合并回统一的张量，以便继续执行后续操作。**Attention 分数的计算并不依赖显存中的模型权重，只需使用之前生成的 Q、K、V 向量即可，因此拆分处理不会带来额外的 IO 开销。**
-
-![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202507060933382.png)
-
-
 
 ## Chunked perfill
 
@@ -227,12 +254,109 @@ Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microso
 
 
 
+
+# 五、Decode
+
+## Decode在做什么
+自回归过程，将之前缓存的k,v读出来，和当前新的kv cat在一起，计算logic，每次只输出一个token
+
+![[Pasted image 20261005154057.png]]
+
+## 性能卡点
+自回归生成过程，token一个一个的生成，但是算attention的时候，是需要前面所有的token的k,v值以及模型权重，取出来计算预测下一个token，因此对显存的需求很大，计算是有点冗余的。
+==解决方式：==
+1. 批处理/chunked perfill
+2. 投机解码
+3. 更高效/准确的解码策略
+## 批处理-Continuous batch
+https://www.usenix.org/conference/osdi22/presentation/yu
+
+### 为什么批处理
+1. 每次取出一次kv cache中的kv，但是只计算一个token很亏，算力有冗余，可以算一批
+2. 
+
+
+### 批处理面临三个问题：
+
+1. 早执行完毕的reqest怎么处理：通过scheduler的loop形式一直检查，有完成的请求就拿出来，并检查后来的request并放入
+
+2. 后加入的request怎么处理
+
+3. 不同长度的prompt如何在一个batch内推理： perfill阶段，将全部reqest进行flatten成一个大的一维向量，decode阶段由于都是单个token维度的计算，因此不涉及这个问题
+
+### Iteration-Level Scheduling
+
+![[Pasted image 20260927010539.png]]
+
+iteration-level scheduling，不再等待 batch 中所有序列生成完成，而是每轮迭代动态决定 batch 大小。这样一来，batch 中的某个序列一旦完成生成，就可以立即被替换为新的请求，从而相比 Static Batching 显著提升了 GPU 的利用率。
+
+在实践中应用 iteration-level scheduling 时，我们面临的一个主要挑战就是如何实现批处理。为了达到高效执行的目的，执行引擎应当能够对任意被选中的一组请求进行批处理执行。否则，就只能一个一个地处理请求，无法发挥 GPU 的大规模并行计算能力。然而，即使只是两条请求，也无法保证它们在下一轮迭代中能够合并执行。**这是因为要实现批处理，不仅需要多个请求处于相同的阶段，还必须具有形状完全一致的输入张量。**一对请求在以下 3 种情况下，下一次迭代不能一起批处理：
+![[Pasted image 20260927230509.png]]
+
+- **两个请求都处于 prefill 阶段，但输入 token 数量不同（例如 x₃ 和 x₄）**。prefill 阶段的 Attention 是一次性并行处理整个 prompt 序列。如果两个请求的输入 token 长度不同，它们的输入张量在长度维度（L）上不一致，无法拼接成统一形状的 batch 张量 `[B, L, H]`，导致无法合批执行。请求 x₃ 的 prompt 长度是 2，输入张量形状为 `[1, 2, H]`；请求 x₄ 的 prompt 长度是 3，输入张量形状为 `[1, 3, H]`，无法拼接成一个 `[2, L, H]` 的张量，因此不能合批执行。
+- **两个请求都处于 decode 阶段，但正在生成不同位置的 token（例如 x₁ 和 x₂）。** 虽然 decode 阶段每次只处理一个 token，输入张量形状都是 `[1, H]`，但此阶段的 Attention 会依赖之前生成的所有 token（即使用 KV cache）。如果请求的生成位置不同，其 KV cache 长度也不同，导致 Attention 的 Key/Value 张量形状不同。
+- **两个请求处于不同阶段：一个在 prefill，另一个在 decode（例如 x₁ 和 x₃）。** prefill 的一次迭代会并行处理所有输入 token，以提高效率，而 decode 阶段的一次迭代则只处理一个 token。
+
+**为了解决上述挑战，一个可行的思路是：尽可能寻找这些请求在计算过程中的共性，以便将相同的部分合并执行，从而最大化批处理效率；对于差异部分，则单独处理。**
+
+### Selective Batching
+**elective Batching 的核心原理在于：仅对适合批处理的操作执行批处理，不适合批处理的操作则单独处理。**
+
+具体来说：
+
+- 对于 `preproj`、`postproj`、`FFN1` 和 `FFN2` 这类线性变换或归一化操作，它们的计算与序列长度无关，只是在 hidden_size 维度上做线性转换，并且都需要从显存读取权重。**因此，可以将 batch 内所有 token 拉平成一个二维张量**，例如 x₃ 和 x₄ 的输入张量可以合并为一个形状为 [∑L,H]=[5,H][∑L,H]=[5,H] 的二维张量，一次性完成所有相关计算。这样不仅简化了操作，还能显著提升权重加载的利用率，降低 IO 次数，提高整体执行效率。
+- 对于 Attention 操作，由于每个请求的 mask、KV cache 和 token 位置可能不同，导致其张量形状不一致，无法直接合并处理。Selective Batching 会在进入 Attention 之前将 batch 拆分，逐个请求单独计算 Attention 分数，完成后再将结果合并回统一的张量，以便继续执行后续操作。**Attention 分数的计算并不依赖显存中的模型权重，只需使用之前生成的 Q、K、V 向量即可，因此拆分处理不会带来额外的 IO 开销。**
+
+![](https://chengzw258.oss-cn-beijing.aliyuncs.com/Article/202507060933382.png)
+
+
+### 参数调优
+
+
+
+
+
 ## 解码策略
 
+### temperature
+主要作用：调节概率分布的“尖锐/平坦”程度
+模型原始 logits 记为z_i。softmax 得到概率：
+$$p_i = \frac{\exp(z_i)}{\sum_j \exp(z_j)}$$
 
+加入温度 T后：
+$$p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$$
 
+- **T < 1**：logits 差距被放大，softmax 后分布更尖锐，高概率 token 更容易被选中，生成更确定、保守。
+    
+- **T = 1**：使用模型原始分布。
+    
+- **T > 1**：logits 差距被缩小，分布更平坦，低概率 token 也有更多机会，生成更随机、多样。
+    
+- **T → 0**：极限上接近 greedy，总是选概率最高的 token。实际实现里通常直接把 T=0 当作贪心解码
 
+影响：
+- 低温度：适合事实问答、代码、数学、结构化输出，但容易重复、死板。
+- 高温度：适合创意写作、头脑风暴，但更容易跑偏、幻觉、语法错误。
+### top k（只保留概率最高的k个候选）
 
+1. 对所有 token 的 logits 排序；
+    
+2. 只保留分数最高的 kk 个 token；
+    
+3. 其余 token 概率置 0；
+    
+4. 在剩下的 k 个 token 中重新归一化并采样。
+
+大模型词表通常有几万到几十万 token。很多低概率 token 虽然单个概率很低，但数量巨大，合起来可能被采样到，导致输出莫名其妙。Top-k 直接砍掉长尾，只从最可能的 k 个里选，降低“胡言乱语”的概率。
+
+==一般用法：==
+> logits → 除以温度 T → 选 top-k → 对 top-k 重新 softmax → 采样
+
+- 稳定任务：T=0~0.3，top-k=1~20，top-p=0.1~0.5；
+    
+- 平衡任务：T=0.7~1.0，top-k=40~100，top-p=0.9~0.95；
+    
+- 创意任务：T=1.0~1.5，top-k 更大或 top-p=0.95~1.0。
 
 ## 投机解码
 
@@ -286,35 +410,58 @@ Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microso
 
 小结：GQA 是线上部署首选；MLA 是新一代长上下文模型方向；MQA 现在已经很少单独使用。
 
-## kv压缩减少存储
-将 FP16/BF16 的 KV 张量，用更低比特存储，在显存中减少每个 token 的 KV 字节占用，Prefill 计算不变，仅改变存储格式，解码阶段实时反量化读取 K/V。
+## KV Cache的存储形式
 
-1. **FP8 KV Cache（当前生产主流）**  
-    
-    原理：把 KV 缓存存储为 FP8_e4m3，显存直接减半，vLLM、SGLang 原生支持。 
-    
-    优点：硬件原生支持，反量化开销小，精度损失很小，工程落地成熟。 缺点：需要支持 FP8 的 GPU（Ada、Hopper、Blackwell）；旧硬件无法加速。
-    
-2. **INT8 / INT4 KV Cache**  
-    
-    原理：将 KV 压缩为 8bit、4bit 整数，进一步压缩显存。代表方案 KIVI、TurboQuant。 KIVI 采用**非对称量化**：Key 按通道量化，Value 按 Token 量化，解决 KV 缓存数值分布不一致问题。 
-    
-    优点：压缩比高，旧 GPU 也可以运行。 
-    
-    缺点：4bit 会带来长上下文检索能力下降；反量化带来额外算力开销；vLLM/SGLang 官方原生支持有限，更多见于 LMDeploy、TurboMind。
-    
-3. **KV‑Compress、TurboQuant 编解码方案**  
-    
-    原理：针对每个注意力头使用可变压缩倍率，块级压缩 KV block，和 PagedAttention 分页架构兼容。 
-    
-    优点：兼顾压缩率与精度。 
-    
-    缺点：自定义内核，通用性差，大规模生产落地较少。
-    
+不改变 KV 本身大小，优化显存分配、生命周期、共享复用，解决碎片、重复计算浪费，是现代推理引擎的基础底座。
 
-权衡边界：FP8 优先线上使用；INT4 仅用于对精度容忍度高的业务；高检索、Agent 工具调用场景，不建议直接 4bit KV。
+### 朴素 Dynamic kv cahche
 
-## 动态稀疏与 Token 驱逐 Eviction（动态丢弃不重要 KV）
+
+
+
+### PagedAttention 分页注意力（vLLM， sglang内存管理 核心）   
+
+https://arxiv.org/abs/2309.06180
+原理：借鉴操作系统分页机制，KV Cache 切分为固定大小 Block 页，逻辑连续，物理显存可以非连续存放，用 BlockTable 页表记录映射关系。 
+收益：消除显存碎片，GPU 显存利用率从 20‑40% 提升至 95% 以上；支持抢占、会话迁移。 
+局限：不减少 KV 总字节，只优化分配效率；SGLang、MindIE 都实现同类机制。
+
+
+
+### Prefix Caching 前缀缓存 - RadixAttention（SGLang）
+ 
+原理：不同请求存在公共前缀（相同 System Prompt、知识库上下文、工具描述），把已经计算完成的 KV Block 保存，通过基数树 RadixTree 索引，新请求命中直接复用 KV，跳过重复 Prefill 计算。 
+
+收益：大幅降低 TTFT 首 token 延迟，减少重复 Prefill 算力消耗；System Prompt 越长收益越高。 
+变种：vLLM APC 自动前缀缓存，跨会话共享 KV 块。 局限：需要足够显存存放公共前缀；会话多、前缀差异大时命中率下降。
+### KV Cache Offloading 分层卸载* （sglang中的hicache）
+
+原理：GPU 显存放不下全部 KV，把冷 KV 块卸载到 CPU 内存、NVMe SSD，需要时再加载回 GPU 显存计算；代表 FlexGen、InfiniGen、MooncakeStore。 分层 L1 (GPU HBM)、L2 (CPU DRAM)、L3 (SSD / 分布式存储)。 
+
+优点：极大扩展单实例可承载上下文长度。 
+缺点：卸载加载会带来延迟抖动；SSD 介质访问延迟高，只适合冷 KV。
+
+### 相关sglang参数调优
+| 组件              | 是否可独立启用/禁用           | 关键参数                          | 默认状态      |
+| --------------- | -------------------- | ----------------------------- | --------- |
+| **Radix Cache** | ✅ 可禁用                | `--disable-radix-cache`       | 启用        |
+| **Page Cache**  | ✅ 可调整粒度，但分页机制本身是底层基础 | `--page-size`（默认64）           | 启用（页大小64） |
+| **HiCache**     | ✅ 可选启用               | `--enable-hierarchical-cache` | 禁用        |
+
+
+使用场景：
+
+| 配置                     | Radix Cache | Page Cache    | HiCache | 适用场景                                     |
+| ---------------------- | ----------- | ------------- | ------- | ---------------------------------------- |
+| **默认**                 | ✅ 启用        | ✅ 启用（page=64） | ❌ 禁用    | 通用场景，有前缀复用需求                             |
+| **禁用 Radix**           | ❌ 禁用        | ✅ 启用          | ❌ 禁用    | 无前缀复用、需要确定性输出                            |
+| **启用 HiCache**         | ✅ 启用        | ✅ 启用          | ✅ 启用    | 长上下文、多轮对话、显存不足                           |
+| **HiCache + 禁用 Radix** | ❌ 禁用        | ✅ 启用          | ✅ 启用    | 理论上可行，但 HiCache 的前缀查找依赖 Radix Tree，实际不推荐 |
+
+
+
+
+## kv 驱逐 Eviction（动态丢弃不重要 KV）
 
 当显存不足，识别、丢弃注意力权重低的历史 token 对应的 KV Cache，保留关键 token，把 KV 占用从 O (N) 变成 O (窗口大小)，不修改模型权重，推理运行时动态执行，非常适合超长上下文场景。
 
@@ -351,34 +498,34 @@ Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microso
 
 适用场景：文档解析、超长对话 Agent；风险：驱逐错误关键 token 会造成幻觉、信息丢失；不能无脑开最大驱逐。
 
-## 内存管理工程优化（更高效分配、复用 KV Cache）
+## kv压缩减少存储
+将 FP16/BF16 的 KV 张量，用更低比特存储，在显存中减少每个 token 的 KV 字节占用，Prefill 计算不变，仅改变存储格式，解码阶段实时反量化读取 K/V。
 
-不改变 KV 本身大小，优化显存分配、生命周期、共享复用，解决碎片、重复计算浪费，是现代推理引擎的基础底座。
+1. **FP8 KV Cache（当前生产主流）**  
+    
+    原理：把 KV 缓存存储为 FP8_e4m3，显存直接减半，vLLM、SGLang 原生支持。 
+    
+    优点：硬件原生支持，反量化开销小，精度损失很小，工程落地成熟。 缺点：需要支持 FP8 的 GPU（Ada、Hopper、Blackwell）；旧硬件无法加速。
+    
+2. **INT8 / INT4 KV Cache**  
+    
+    原理：将 KV 压缩为 8bit、4bit 整数，进一步压缩显存。代表方案 KIVI、TurboQuant。 KIVI 采用**非对称量化**：Key 按通道量化，Value 按 Token 量化，解决 KV 缓存数值分布不一致问题。 
+    
+    优点：压缩比高，旧 GPU 也可以运行。 
+    
+    缺点：4bit 会带来长上下文检索能力下降；反量化带来额外算力开销；vLLM/SGLang 官方原生支持有限，更多见于 LMDeploy、TurboMind。
+    
+3. **KV‑Compress、TurboQuant 编解码方案**  
+    
+    原理：针对每个注意力头使用可变压缩倍率，块级压缩 KV block，和 PagedAttention 分页架构兼容。 
+    
+    优点：兼顾压缩率与精度。 
+    
+    缺点：自定义内核，通用性差，大规模生产落地较少。
+    
 
-1. **PagedAttention 分页注意力（vLLM 核心）**   
-    
-    https://arxiv.org/abs/2309.06180
-    原理：借鉴操作系统分页机制，KV Cache 切分为固定大小 Block 页，逻辑连续，物理显存可以非连续存放，用 BlockTable 页表记录映射关系。 
-    
-    收益：消除显存碎片，GPU 显存利用率从 20‑40% 提升至 95% 以上；支持抢占、会话迁移。 
-    
-    局限：不减少 KV 总字节，只优化分配效率；SGLang、MindIE 都实现同类机制。
-    
-2. **Prefix Caching 前缀缓存 / RadixAttention（SGLang）**  
-    
-    原理：不同请求存在公共前缀（相同 System Prompt、知识库上下文、工具描述），把已经计算完成的 KV Block 保存，通过基数树 RadixTree 索引，新请求命中直接复用 KV，跳过重复 Prefill 计算。 
-    
-    收益：大幅降低 TTFT 首 token 延迟，减少重复 Prefill 算力消耗；System Prompt 越长收益越高。 
-    
-    变种：vLLM APC 自动前缀缓存，跨会话共享 KV 块。 局限：需要足够显存存放公共前缀；会话多、前缀差异大时命中率下降。
-    
-3. **KV Cache Offloading 分层卸载**  
-    
-    原理：GPU 显存放不下全部 KV，把冷 KV 块卸载到 CPU 内存、NVMe SSD，需要时再加载回 GPU 显存计算；代表 FlexGen、InfiniGen、MooncakeStore。 分层 L1 (GPU HBM)、L2 (CPU DRAM)、L3 (SSD / 分布式存储)。 
-    
-    优点：极大扩展单实例可承载上下文长度。 
-    
-    缺点：卸载加载会带来延迟抖动；SSD 介质访问延迟高，只适合冷 KV。
+权衡边界：FP8 优先线上使用；INT4 仅用于对精度容忍度高的业务；高检索、Agent 工具调用场景，不建议直接 4bit KV。
+
 
 ## 分布式与系统架构级 KV Cache 优化（集群维度）
 
@@ -405,9 +552,6 @@ Github：[https://github.com/microsoft/sarathi-serve](https://github.com/microso
     L1 GPU 显存，L2 本机 CPU 内存，L3 分布式共享存储；统一管理本地 + 分布式 KV 缓存，兼顾访问延迟与总容量。
 
 
-## sglang应用-radis cache原理 
-
-
 ## sglang生产应用之hicache
 https://docs.sglang.io/docs/advanced_features/hicache
 
@@ -419,12 +563,12 @@ https://github.com/kvcache-ai/Mooncake
 https://kvcache-ai.github.io/Mooncake/
 
 
-# pd分离和pd不分离
+# 七、pd分离和pd不分离
 
 
 
 
-# 七、serving：scheduler调度
+# 八、serving：scheduler调度
 
 
 ## 调度策略
@@ -458,7 +602,7 @@ https://kvcache-ai.github.io/Mooncake/
 
 
 
-# 八、分布式通信和并行策略
+# 九、分布式通信和并行策略
 
 ## 通信协议
 
@@ -507,12 +651,24 @@ ep
 
 
 
-# 九、attention backend
+# 十、attention backend
 
 **Attention Backend 是底层的“计算内核”**：它是真正在 GPU 上执行注意力计算的**算子实现**（如 FlashAttention、FlashInfer、Triton 等）。它负责“如何高效计算一次注意力”，解决的是 **“计算性能”** 问题
 
+## flashAttention
+
+### 原理
 
 
+
+### sglang参数
+
+
+
+
+
+
+# 十一、算子优化
 
 
 
