@@ -820,17 +820,45 @@ PP 能降低每卡权重占用，而且 stage 间只传 activation；但单个�
 
 ### RDMA（远端内存访问）
 
-绕过cpu，直接gpu和gpu之间直接通信
+多节点时，绕过cpu，直接gpu和gpu之间直接通信
 
 
 
 
 
 ### NVlink
+NVLink是NVIDIA专为高性能计算设计的点对点互联技术，旨在实现GPU间或GPU与CPU间的高速数据交换[](https://cloud.tencent.cn/developer/article/2517231?policyId=1003#1)
+- **核心优势**：提供远超PCIe的带宽和低延迟。例如，NVLink 5.0的总带宽可达**1.8 TB/s**，而PCIe 5.0 x16仅约**126 GB/s**[](https://cloud.tencent.cn/developer/article/2517231?policyId=1003#1)。
+    
+- **关键特性**：支持**缓存一致性**，允许CPU和GPU共享统一内存空间，减少数据拷贝开销[](https://cloud.tencent.cn/developer/article/2517231?policyId=1003#1)。
+    
+- **NVLink-C2C (Chip-to-Chip)**：这是NVLink的片间互联版本，专门用于连接Grace CPU和Hopper/Blackwell GPU，提供高达**900 GB/s**的双向带宽。
 
 
+### PCIe (Peripheral Component Interconnect Express)
 
+PCIe是CPU与GPU之间最普遍、最基础的通信协议。它由PCI-SIG组织维护，是一种高速串行计算机扩展总线标准。
 
+- **特点**：作为一种通用标准，PCIe具有出色的兼容性和灵活性，几乎所有现代GPU都通过PCIe插槽与CPU通信[](http://koreascience.kr/article/CFKO202022449679756.pdf#1#1)。
+    
+- **局限**：尽管PCIe不断迭代（如PCIe 5.0），其带宽和延迟在面对AI训练等需要频繁、海量数据交换的场景时，仍会成为系统瓶颈[](https://cloud.tencent.cn/developer/article/2517231?policyId=1003#1)。
+
+### AMD Infinity Fabric
+
+Infinity Fabric是AMD的互联技术，用于连接其CPU、GPU和加速器，构成其异构计算系统的基础。
+
+- **应用场景**：在AMD的Instinct MI300A等APU中，CPU和GPU通过Infinity Fabric实现**缓存一致的共享内存**，峰值吞吐量可达**5.3 TB/s**。
+    
+- **可扩展性**：第五代Infinity Fabric支持跨节点、跨机柜连接，是AMD机架级部署方案的核心。
+    
+
+### CXL (Compute Express Link)
+
+CXL是一种开放的**缓存一致性互联协议**，构建在PCIe物理层之上，旨在统一CPU与GPU、FPGA等加速器之间的通信接口[](https://arxiv.org/pdf/2411.02814#8#1)。
+
+- **核心价值**：通过CXL，CPU可以像访问本地内存一样，通过缓存一致的方式访问GPU的内存，简化了编程模型并减少了数据同步开销[](https://arxiv.org/pdf/2411.02814#8#1)。
+    
+- **子协议**：CXL包含[CXL.io](https://cxl.io/)（I/O语义）、CXL.cache（设备缓存一致性）和CXL.mem（内存访问）三个子协议，为不同类型的数据交换提供支持。
 
 ## 通信原语
 
